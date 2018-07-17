@@ -4426,7 +4426,8 @@ static int tcp_try_rmem_schedule(struct sock *sk, struct sk_buff *skb,
 	if (atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
 	    !sk_rmem_schedule(sk, skb, size)) {
 
-		if (tcp_prune_queue(sk) < 0)
+		if (__ratelimit(&tcp_sk(sk)->collapse_ratelimit) &&
+		    tcp_prune_queue(sk) < 0)
 			return -1;
 
 		while (!sk_rmem_schedule(sk, skb, size)) {
