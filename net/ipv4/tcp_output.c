@@ -278,6 +278,8 @@ static u16 tcp_select_window(struct sock *sk)
 	}
 	tp->rcv_wnd = new_win;
 	tp->rcv_wup = tp->rcv_nxt;
+	if (tp->rcv_wnd > tp->rcv_wmax)
+		tp->rcv_wmax = tp->rcv_wnd;
 
 	/* Make sure we do not exceed the maximum possible
 	 * scaled window.
@@ -3389,6 +3391,7 @@ static void tcp_connect_init(struct sock *sk)
 	else
 		tp->rcv_tstamp = tcp_jiffies32;
 	tp->rcv_wup = tp->rcv_nxt;
+	tp->rcv_wmax = tp->rcv_wnd;
 	tp->copied_seq = tp->rcv_nxt;
 
 	inet_csk(sk)->icsk_rto = tcp_timeout_init(sk);

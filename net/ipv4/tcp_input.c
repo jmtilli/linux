@@ -4021,12 +4021,28 @@ static inline bool tcp_paws_discard(const struct sock *sk,
  * of RCV.NXT. Peer still did not advance his SND.UNA when we
  * delayed ACK, so that hisSND.UNA<=ourRCV.WUP.
  * (borrowed from freebsd)
+ *
+ * Additionally, if the segment is an ACK segment with no data, possibly
+ * sent by tcp_send_dupack() as a result of incorrect sequence number,
+ * be slightly more loose to prevent stalled TCP connections and
+ * potential ACK storms (well, ACK storms are prevented also by
+ * rate-limiting ACKs) and take fully into account the sequence number
+ * information carried by the ACK packet for resyncing the stalled TCP
+ * connection. This prevents the case of both endpoints sending data
+ * simultaneously, rcv_wup being lost in both directions at the same
+ * time, thus causing both endpoints to consider all packets (including
+ * those sent by tcp_send_dupack()) sent by the opposite endpoint as
+ * invalid.
  */
 
 static inline bool tcp_sequence(const struct tcp_sock *tp, u32 seq, u32 end_seq)
 {
-	return	!before(end_seq, tp->rcv_wup) &&
-		!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
+	if (end_seq == seq)
+		return	!before(end_seq, tp->rcv_wup - tp->rcv_wmax) &&
+			!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
+	else
+		return	!before(end_seq, tp->rcv_wup) &&
+			!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
 }
 
 /* When we get a reset we do this. */
@@ -5822,6 +5838,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		 */
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wmax = tcp_receive_window(tp);
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.
@@ -5926,6 +5943,7 @@ discard:
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->copied_seq = tp->rcv_nxt;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wmax = tcp_receive_window(tp);
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.
