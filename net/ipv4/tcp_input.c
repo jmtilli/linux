@@ -4025,7 +4025,7 @@ static inline bool tcp_paws_discard(const struct sock *sk,
 
 static inline bool tcp_sequence(const struct tcp_sock *tp, u32 seq, u32 end_seq)
 {
-	return	!before(end_seq, tp->rcv_wup) &&
+	return	!before(end_seq, tp->rcv_wup - tp->rcv_wmax) &&
 		!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
 }
 
@@ -5822,6 +5822,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		 */
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wmax = tcp_receive_window(tp);
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.
@@ -5926,6 +5927,7 @@ discard:
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->copied_seq = tp->rcv_nxt;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wmax = tcp_receive_window(tp);
 
 		/* RFC1323: The window in SYN & SYN/ACK segments is
 		 * never scaled.
