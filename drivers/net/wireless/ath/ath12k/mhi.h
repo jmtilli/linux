@@ -43,4 +43,6 @@ void ath12k_mhi_clear_vector(struct ath12k_base *ab);
 void ath12k_mhi_suspend(struct ath12k_pci *ar_pci);
 void ath12k_mhi_resume(struct ath12k_pci *ar_pci);
 
+int ath12k_mhi_set_qrtr_endpoint_id(struct ath12k_base *ab);
+
 #endif
