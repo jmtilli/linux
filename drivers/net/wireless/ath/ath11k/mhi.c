@@ -10,6 +10,8 @@
 #include <linux/of_address.h>
 #include <linux/ioport.h>
 
+#include <net/qrtr.h>
+
 #include "core.h"
 #include "debug.h"
 #include "mhi.h"
@@ -520,6 +522,26 @@ int ath11k_mhi_resume(struct ath11k_pci *ab_pci)
 	ret = mhi_pm_resume_force(ab_pci->mhi_ctrl);
 	if (ret) {
 		ath11k_warn(ab, "failed to resume mhi: %d", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+int ath11k_mhi_set_qrtr_endpoint_id(struct ath11k_base *ab)
+{
+	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+	struct ath11k_qmi *qmi = &ab->qmi;
+	int ret;
+
+	/* Pass endpoint ID up for QMI usage. */
+	ret = qrtr_endpoint_id_get_or_assign(ab_pci->mhi_ctrl,
+					     &qmi->handle.endpoint_id);
+	ath11k_dbg(ab, ATH11K_DBG_PCI,
+		   "queried mhi_ctrl QRTR endpoint ID: %u\n",
+		   qmi->handle.endpoint_id);
+	if (ret) {
+		ath11k_warn(ab, "failed to query QRTR endpoint ID: %d\n", ret);
 		return ret;
 	}
 
