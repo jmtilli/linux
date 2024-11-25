@@ -41,6 +41,7 @@ static int qrtr_tun_open(struct inode *inode, struct file *filp)
 	init_waitqueue_head(&tun->readq);
 
 	tun->ep.xmit = qrtr_tun_send;
+	tun->ep.endpoint_data = inode;
 
 	filp->private_data = tun;
 
