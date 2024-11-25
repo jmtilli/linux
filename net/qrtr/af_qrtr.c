@@ -11,6 +11,7 @@
 #include <linux/wait.h>
 
 #include <net/sock.h>
+#include <net/qrtr.h>
 
 #include "qrtr.h"
 
@@ -726,6 +727,114 @@ static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt,
 }
 
 /**
+ * qrtr_endpoint_id_get() - get a registered endpoint for given data
+ * @data: endpoint-specific data to fetch ID for
+ * @id: pointer to store endpoint ID into
+ * Return: 0 on success, negative error code on failure
+ *
+ * The endpoint-specific data must not be NULL.
+ * The output parameter id must not be NULL.
+ * If no endpoint ID can be mapped to the endpoint-specific data, id will be
+ * set to 0.
+ */
+int qrtr_endpoint_id_get(const void *data, u32 *id)
+{
+	unsigned long idx = 0;
+	void *iter_data = NULL;
+
+	if (!id)
+		return -EINVAL;
+
+	if (!data)
+		return -EINVAL;
+
+	*id = 0;
+	rcu_read_lock();
+	xa_for_each_range(&qrtr_endpoints, idx, iter_data,
+			  QRTR_ENDPOINT_RANGE.min, QRTR_ENDPOINT_RANGE.max) {
+		if (iter_data == data) {
+			*id = idx;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qrtr_endpoint_id_get);
+
+/**
+ * qrtr_endpoint_id_assign() - assigns a new endpoint ID for given data
+ * @data: endpoint-specific data to assign new ID for
+ * @id: pointer to store endpoint ID into
+ * Return: 0 on success, negative error code on failure
+ *
+ * The endpoint-specific data must not be NULL.
+ * The output parameter id must not be NULL.
+ * On error, id will be set to 0.
+ */
+int qrtr_endpoint_id_assign(void *data, u32 *id)
+{
+	int rc = 0;
+
+	if (!id)
+		return -EINVAL;
+
+	if (!data)
+		return -EINVAL;
+
+	rc = xa_alloc_cyclic(&qrtr_endpoints, id, data, QRTR_ENDPOINT_RANGE,
+			     &next_endpoint_id, GFP_KERNEL);
+	if (rc)
+		*id = 0;
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qrtr_endpoint_id_assign);
+
+/**
+ * qrtr_endpoint_id_get_or_assign() - gets or assigns endpoint ID for data
+ * @data: endpoint-specific data to assign new ID for
+ * @id: pointer to store endpoint ID into
+ * Return: positive on success, negative error code on failure
+ *
+ * The endpoint-specific data must not be NULL.
+ *
+ * If the endpoint-specific data is already registered to an endpoint ID, this
+ * ID will be assigned to id. Otherwise, this function assigns a new
+ * endpoint ID and associates it with the given endpoint-specific data.
+ *
+ * The output parameter id must not be NULL. It will either be set to the
+ * fetched or newly assigned endpoint ID on success, or set to 0 on error.
+ */
+int qrtr_endpoint_id_get_or_assign(void *data, u32 *id)
+{
+	int rc = 0;
+
+	if (!data)
+		return -EINVAL;
+
+	if (!id)
+		return -EINVAL;
+
+	rc = qrtr_endpoint_id_get(data, id);
+
+	if (rc) {
+		*id = 0;
+		return rc;
+	}
+
+	if (!*id)
+		rc = qrtr_endpoint_id_assign(data, id);
+
+	if (rc)
+		*id = 0;
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qrtr_endpoint_id_get_or_assign);
+
+/**
  * qrtr_endpoint_register() - register a new endpoint
  * @ep: endpoint to register
  * @nid: desired node id; may be QRTR_EP_NID_AUTO for auto-assignment
@@ -746,9 +855,18 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	if (!node)
 		return -ENOMEM;
 
-	rc = xa_alloc_cyclic(&qrtr_endpoints, &endpoint_id, NULL,
-			     QRTR_ENDPOINT_RANGE, &next_endpoint_id,
-			     GFP_KERNEL);
+	rc = qrtr_endpoint_id_get_or_assign(ep->endpoint_data, &endpoint_id);
+
+	/*
+	 * The previous function fails if ep->endpoint_data is NULL, so retry.
+	 *
+	 * We're going to assign an endpoint ID without endpoint-specific data
+	 * set in this case.
+	 */
+	if (rc)
+		rc = xa_alloc_cyclic(&qrtr_endpoints, &endpoint_id, NULL,
+				     QRTR_ENDPOINT_RANGE, &next_endpoint_id,
+				     GFP_KERNEL);
 
 	if (rc < 0)
 		goto free_node;

@@ -12,13 +12,18 @@ struct sk_buff;
 /**
  * struct qrtr_endpoint - endpoint handle
  * @xmit: Callback for outgoing packets
+ * @endpoint_data: endpoint-specific data pointer, can be NULL
  *
  * The socket buffer passed to the xmit function becomes owned by the endpoint
  * driver.  As such, when the driver is done with the buffer, it should
  * call kfree_skb() on failure, or consume_skb() on success.
+ *
+ * If endpoint_data is NULL, endpoint IDs can not be directly mapped to a
+ * specific endpoint.
  */
 struct qrtr_endpoint {
 	int (*xmit)(struct qrtr_endpoint *ep, struct sk_buff *skb);
+	void *endpoint_data;
 	/* private: not for endpoint use */
 	struct qrtr_node *node;
 	u32 id;
