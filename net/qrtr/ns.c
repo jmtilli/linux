@@ -242,7 +242,7 @@ static void lookup_notify(u32 endpoint_id, struct sockaddr_qrtr *to,
 	}
 
 	ret = qrtr_ns_sendmsg(endpoint_id, to, &pkt);
-	if (ret < 0)
+	if (ret < 0 && ret != -ENODEV)
 		pr_err("failed to send lookup notification\n");
 }
 
@@ -261,6 +261,8 @@ static int announce_servers(u32 endpoint_id, struct sockaddr_qrtr *sq)
 	xa_for_each(&node->servers, index, srv) {
 		ret = service_announce_new(endpoint_id, sq, srv);
 		if (ret < 0) {
+			if (ret == -ENODEV)
+				continue;
 			pr_err("failed to announce new service\n");
 			return ret;
 		}
@@ -412,7 +414,7 @@ static int ctrl_cmd_bye(u32 endpoint_id, struct sockaddr_qrtr *from)
 
 		/* Bye will look as if it came from endpoint_id */
 		ret = qrtr_ns_sendmsg(endpoint_id, &sq, &pkt);
-		if (ret < 0) {
+		if (ret < 0 && ret != -ENODEV) {
 			pr_err("failed to send bye cmd\n");
 			return ret;
 		}
@@ -479,7 +481,7 @@ static int ctrl_cmd_del_client(u32 endpoint_id, struct sockaddr_qrtr *from,
 
 		/* Del Client will look as if it came from endpoint_id */
 		ret = qrtr_ns_sendmsg(endpoint_id, &sq, &pkt);
-		if (ret < 0) {
+		if (ret < 0 && ret != -ENODEV) {
 			pr_err("failed to send del client cmd\n");
 			return ret;
 		}
