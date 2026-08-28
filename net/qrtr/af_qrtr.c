@@ -10,6 +10,8 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <linux/rhashtable.h>
+#include <linux/jhash.h>
 
 #include <net/sock.h>
 
@@ -147,8 +149,55 @@ int qrtr_msg_get_endpoint(struct msghdr *msg, u32 *out_endpoint_id)
 
 static unsigned int qrtr_local_nid = 1;
 
+/**
+ * struct qrtr_node_hash_key - hash key for struct qrtr_node
+ * @ep_id: endpoint id or 0
+ * @nid: node id
+ */
+struct qrtr_node_hash_key {
+	u32 ep_id;
+	u32 nid;
+};
+
+/**
+ * struct qrtr_node_hash_helper - adding struct qrtr_node to multiple hashes
+ * @key: hash key
+ * @hash_node: needed to add to rhashtable
+ * @qrtr_node: pointer to struct qrtr_node
+ */
+struct qrtr_node_hash_helper {
+	struct qrtr_node_hash_key key;
+	struct rhash_head hash_node;
+	struct qrtr_node *qrtr_node;
+};
+
+static inline u32 qrtr_node_hashfn(const void *data, u32 len, u32 seed)
+{
+	const struct qrtr_node_hash_helper *helper = data;
+
+	return jhash2((u32 *)&helper->key, sizeof(helper->key) / sizeof(u32),
+		      seed);
+}
+
+static inline int qrtr_node_compare(struct rhashtable_compare_arg *arg,
+				    const void *ptr)
+{
+	const struct qrtr_node_hash_key *key = arg->key;
+	const struct qrtr_node_hash_helper *helper = ptr;
+
+	return key->ep_id != helper->key.ep_id ||
+	       key->nid != helper->key.nid;
+}
+
 /* for node ids */
-static RADIX_TREE(qrtr_nodes, GFP_ATOMIC);
+static struct rhashtable qrtr_nodes_hash;
+static struct rhashtable_params qrtr_nodes_hash_params = {
+	.head_offset = offsetof(struct qrtr_node_hash_helper, hash_node),
+	.key_offset = offsetof(struct qrtr_node_hash_helper, key),
+	.key_len = sizeof(struct qrtr_node_hash_key),
+	.obj_hashfn = qrtr_node_hashfn,
+	.obj_cmpfn = qrtr_node_compare,
+};
 static DEFINE_SPINLOCK(qrtr_nodes_lock);
 /* broadcast list */
 static LIST_HEAD(qrtr_all_nodes);
@@ -161,27 +210,6 @@ static u32 next_endpoint_id;
 
 /* local port allocation management */
 static DEFINE_XARRAY_ALLOC(qrtr_ports);
-
-/* The radix tree API uses fixed unsigned long keys and we will have to make
- * do with that temporarily, until a later commit uses rhashtable.
- * These keys are often a combination of node IDs and port numbers or
- * endpoint IDs and node IDs (all currently u32).
- * Using the high 32 bits for the node/endpoint ID and the low 32 bits for the
- * port number/node ID will work fine to create keys on platforms where
- * unsigned long is 64 bits wide, but obviously is not be possible on
- * platforms where unsigned long is smaller.
- * Virtually split up unsigned long in half and assign the upper bits to
- * node/endpoint IDs and the lower bits to the port number/node ID, however
- * big that may be.
- */
-#define QRTR_XARRAY_INDEX_BITS  (8 /* CHAR_BIT */ * sizeof(unsigned long))
-#define QRTR_INDEX_HALF_BITS (QRTR_XARRAY_INDEX_BITS >> 1)
-
-#define QRTR_INDEX_HALF_UNSIGNED_MAX ((~(unsigned long)(0)) >> QRTR_INDEX_HALF_BITS)
-#define QRTR_INDEX_HALF_UNSIGNED_MIN ((unsigned long)(0))
-
-#define QRTR_INDEX_HALF_SIGNED_MAX ((long)(QRTR_INDEX_HALF_UNSIGNED_MAX) >> 1)
-#define QRTR_INDEX_HALF_SIGNED_MIN ((long)(-1) - QRTR_INDEX_HALF_SIGNED_MAX)
 
 /**
  * struct qrtr_node - endpoint node
@@ -246,20 +274,36 @@ static void qrtr_port_put(struct qrtr_sock *ipc);
 static void __qrtr_node_release(struct kref *kref)
 {
 	struct qrtr_node *node = container_of(kref, struct qrtr_node, ref);
-	struct radix_tree_iter iter;
 	struct qrtr_tx_flow *flow;
 	unsigned long flags;
-	void __rcu **slot;
 	unsigned long index;
+	struct rhashtable_iter hash_iter;
+	struct qrtr_node_hash_helper *helper;
 
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
+
+	rhashtable_walk_enter(&qrtr_nodes_hash, &hash_iter);
+
 	/* If the node is a bridge for other nodes, there are possibly
 	 * multiple entries pointing to our released node, delete them all.
 	 */
-	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
-		if (*slot == node)
-			radix_tree_iter_delete(&qrtr_nodes, &iter, slot);
-	}
+	do {
+		rhashtable_walk_start(&hash_iter);
+
+		while ((helper = rhashtable_walk_next(&hash_iter)) && !IS_ERR(helper)) {
+			if (helper->qrtr_node != node)
+				continue;
+			rhashtable_remove_fast(&qrtr_nodes_hash,
+					       &helper->hash_node,
+					       qrtr_nodes_hash_params);
+			kfree(helper);
+		}
+
+		rhashtable_walk_stop(&hash_iter);
+	} while (helper == ERR_PTR(-EAGAIN));
+
+	rhashtable_walk_exit(&hash_iter);
+
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 
 	list_del(&node->item);
@@ -484,19 +528,20 @@ static struct qrtr_node *qrtr_node_lookup(unsigned int endpoint_id,
 					  unsigned int nid)
 {
 	struct qrtr_node *node = NULL;
+	struct qrtr_node_hash_helper *hash_helper = NULL;
 	unsigned long flags;
-	unsigned long key = 0;
-
-	if (endpoint_id > QRTR_INDEX_HALF_UNSIGNED_MAX ||
-	    nid > QRTR_INDEX_HALF_UNSIGNED_MAX)
-		return node;
-
-	key = ((unsigned long)(endpoint_id) << QRTR_INDEX_HALF_BITS) |
-	      ((unsigned long)(nid) & QRTR_INDEX_HALF_UNSIGNED_MAX);
+	struct qrtr_node_hash_key key;
 
 	mutex_lock(&qrtr_node_lock);
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
-	node = radix_tree_lookup(&qrtr_nodes, key);
+
+	key.ep_id = endpoint_id;
+	key.nid = nid;
+	hash_helper = rhashtable_lookup_fast(&qrtr_nodes_hash, &key,
+					     qrtr_nodes_hash_params);
+	if (hash_helper)
+		node = hash_helper->qrtr_node;
+
 	node = qrtr_node_acquire(node);
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 	mutex_unlock(&qrtr_node_lock);
@@ -514,30 +559,80 @@ static struct qrtr_node *qrtr_node_lookup(unsigned int endpoint_id,
 static int qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
 {
 	unsigned long flags;
-	unsigned long key;
+	int rc = 0;
+	struct qrtr_node_hash_helper *helper_ep0;
+	struct qrtr_node_hash_helper *helper_ep;
+	int did_insert0 = 0;
+	struct qrtr_node_hash_key key_ep0;
+	struct qrtr_node_hash_key key_ep;
 
 	if (nid == QRTR_EP_NID_AUTO)
 		return 0;
 
-	if (node->ep->id > QRTR_INDEX_HALF_UNSIGNED_MAX ||
-	    nid > QRTR_INDEX_HALF_UNSIGNED_MAX)
-		return -EINVAL;
+	key_ep0.ep_id = 0;
+	key_ep0.nid = nid;
+	key_ep.ep_id = node->ep->id;
+	key_ep.nid = nid;
 
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 
-	/* Always insert with the endpoint_id + node_id */
-	key = ((unsigned long)(node->ep->id) << QRTR_INDEX_HALF_BITS) |
-	      ((unsigned long)(nid) & QRTR_INDEX_HALF_UNSIGNED_MAX);
-	radix_tree_insert(&qrtr_nodes, key, node);
+	if (!rhashtable_lookup_fast(&qrtr_nodes_hash, &key_ep0, qrtr_nodes_hash_params)) {
+		helper_ep0 = kzalloc_obj(*helper_ep0, GFP_ATOMIC);
+		if (!helper_ep0) {
+			rc = -ENOMEM;
+		} else {
+			helper_ep0->key.ep_id = 0;
+			helper_ep0->key.nid = nid;
+			helper_ep0->qrtr_node = node;
+			rc = rhashtable_insert_fast(&qrtr_nodes_hash,
+						    &helper_ep0->hash_node,
+						    qrtr_nodes_hash_params);
+			if (!rc)
+				did_insert0 = 1;
+			else
+				kfree(helper_ep0);
+		}
+	}
+	if (rc)
+		goto err_lock;
 
-	if (!radix_tree_lookup(&qrtr_nodes, nid))
-		radix_tree_insert(&qrtr_nodes, nid, node);
+	if (!rhashtable_lookup_fast(&qrtr_nodes_hash, &key_ep, qrtr_nodes_hash_params)) {
+		helper_ep = kzalloc_obj(*helper_ep, GFP_ATOMIC);
+		if (!helper_ep) {
+			rc = -ENOMEM;
+		} else {
+			helper_ep->key.ep_id = node->ep->id;
+			helper_ep->key.nid = nid;
+			helper_ep->qrtr_node = node;
+			rc = rhashtable_insert_fast(&qrtr_nodes_hash,
+						    &helper_ep->hash_node,
+						    qrtr_nodes_hash_params);
+			if (rc)
+				kfree(helper_ep);
+		}
+	} else {
+		rc = -EEXIST;
+	}
+	if (rc && rc != -EEXIST) // FIXME -EEXIST
+		goto err_insert0;
 
 	if (node->nid == QRTR_EP_NID_AUTO)
 		WRITE_ONCE(node->nid, nid);
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 
 	return 0;
+
+err_insert0:
+	if (did_insert0) {
+		rhashtable_remove_fast(&qrtr_nodes_hash,
+				       &helper_ep0->hash_node,
+				       qrtr_nodes_hash_params);
+		kfree(helper_ep0);
+	}
+
+err_lock:
+	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
+	return rc;
 }
 
 /**
@@ -810,14 +905,14 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
 	struct qrtr_node *node = ep->node;
 	struct sockaddr_qrtr src = {AF_QIPCRTR, node->nid, QRTR_PORT_CTRL};
 	struct sockaddr_qrtr dst = {AF_QIPCRTR, qrtr_local_nid, QRTR_PORT_CTRL};
-	struct radix_tree_iter iter;
 	struct qrtr_ctrl_pkt *pkt;
 	struct qrtr_tx_flow *flow;
 	struct sk_buff *skb;
 	unsigned long flags;
 	unsigned long index;
-	void __rcu **slot;
 	u32 endpoint_id;
+	struct rhashtable_iter hash_iter;
+	struct qrtr_node_hash_helper *helper;
 
 	mutex_lock(&node->ep_lock);
 	endpoint_id = node->ep->id;
@@ -826,17 +921,29 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
 
 	/* Notify the local controller about the event */
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
-	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
-		if (*slot != node)
-			continue;
-		src.sq_node = iter.index;
-		skb = qrtr_alloc_ctrl_packet(&pkt, GFP_ATOMIC);
-		if (skb) {
-			pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
-			qrtr_local_enqueue(NULL, skb, endpoint_id,
-					   QRTR_TYPE_BYE, &src, &dst);
+
+	rhashtable_walk_enter(&qrtr_nodes_hash, &hash_iter);
+
+	do {
+		rhashtable_walk_start(&hash_iter);
+
+		while ((helper = rhashtable_walk_next(&hash_iter)) && !IS_ERR(helper)) {
+			if (helper->qrtr_node != node)
+				continue;
+			src.sq_node = helper->key.nid;
+			skb = qrtr_alloc_ctrl_packet(&pkt, GFP_ATOMIC);
+			if (skb) {
+				pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
+				qrtr_local_enqueue(NULL, skb, endpoint_id,
+						   QRTR_TYPE_BYE, &src, &dst);
+			}
 		}
-	}
+
+		rhashtable_walk_stop(&hash_iter);
+	} while (helper == ERR_PTR(-EAGAIN));
+
+	rhashtable_walk_exit(&hash_iter);
+
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 
 	/* Wake up any transmitters waiting for resume-tx from the node */
@@ -1616,8 +1723,14 @@ static int __init qrtr_proto_init(void)
 	if (rc)
 		goto err_sock;
 
+	rc = rhashtable_init(&qrtr_nodes_hash, &qrtr_nodes_hash_params);
+	if (rc)
+		goto err_ns;
+
 	return 0;
 
+err_ns:
+	qrtr_ns_remove();
 err_sock:
 	sock_unregister(qrtr_family.family);
 err_proto:
@@ -1628,6 +1741,7 @@ postcore_initcall(qrtr_proto_init);
 
 static void __exit qrtr_proto_fini(void)
 {
+	rhashtable_destroy(&qrtr_nodes_hash);
 	qrtr_ns_remove();
 	sock_unregister(qrtr_family.family);
 	proto_unregister(&qrtr_proto);
