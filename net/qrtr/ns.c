@@ -23,8 +23,10 @@ static struct {
 	struct socket *sock;
 	struct sockaddr_qrtr bcast_sq;
 	struct list_head lookups;
+	u32 lookup_count;
 	struct workqueue_struct *workqueue;
 	struct work_struct work;
+	void (*saved_data_ready)(struct sock *sk);
 	int local_node;
 } qrtr_ns;
 
@@ -69,6 +71,7 @@ struct qrtr_server {
 struct qrtr_node {
 	unsigned int id;
 	struct xarray servers;
+	u32 server_count;
 };
 
 struct qrtr_ns_endpoint {
@@ -76,18 +79,17 @@ struct qrtr_ns_endpoint {
 	struct xarray nodes;
 };
 
-static struct qrtr_node *node_lookup(u32 endpoint_id, unsigned int node_id)
-{
-	struct qrtr_ns_endpoint *endpoint;
+/* Max nodes, server, lookup limits are chosen based on the current platform
+ * requirements. If the requirement changes in the future, these values can be
+ * increased.
+ */
+#define QRTR_NS_MAX_NODES   512
+#define QRTR_NS_MAX_SERVERS 256
+#define QRTR_NS_MAX_LOOKUPS 64
 
-	endpoint = xa_load(&endpoints, endpoint_id);
-	if (!endpoint)
-		return NULL;
+static u16 node_count;
 
-	return xa_load(&endpoint->nodes, node_id);
-}
-
-static struct qrtr_node *node_new(u32 endpoint_id, unsigned int node_id)
+static struct qrtr_node *node_get(u32 endpoint_id, unsigned int node_id)
 {
 	struct qrtr_ns_endpoint *endpoint;
 	struct qrtr_node *node;
@@ -108,10 +110,15 @@ static struct qrtr_node *node_new(u32 endpoint_id, unsigned int node_id)
 		}
 
 		new_endpoint = true;
-	} else {
-		node = xa_load(&endpoint->nodes, node_id);
-		if (node)
-			return node;
+	}
+
+	node = xa_load(&endpoint->nodes, node_id);
+	if (node)
+		return node;
+
+	if (node_count >= QRTR_NS_MAX_NODES) {
+		pr_err_ratelimited("QRTR clients exceed max node limit!\n");
+		goto error;
 	}
 
 	/* If node didn't exist, allocate and insert it to the tree */
@@ -127,6 +134,8 @@ static struct qrtr_node *node_new(u32 endpoint_id, unsigned int node_id)
 		goto error;
 	}
 
+	node_count++;
+
 	return node;
 error:
 	if (new_endpoint) {
@@ -135,6 +144,35 @@ error:
 	}
 
 	return NULL;
+}
+
+static void node_erase(u32 endpoint_id, unsigned int node_id)
+{
+	struct qrtr_ns_endpoint *endpoint;
+	struct qrtr_node *node;
+
+	endpoint = xa_load(&endpoints, endpoint_id);
+	if (!endpoint)
+		return;
+
+	node = xa_load(&endpoint->nodes, node_id);
+	if (!node)
+		return;
+
+	xa_erase(&endpoint->nodes, node_id);
+	kfree(node);
+	node_count--;
+}
+
+static struct qrtr_node *node_lookup(u32 endpoint_id, unsigned int node_id)
+{
+	struct qrtr_ns_endpoint *endpoint;
+
+	endpoint = xa_load(&endpoints, endpoint_id);
+	if (!endpoint)
+		return NULL;
+
+	return xa_load(&endpoint->nodes, node_id);
 }
 
 static int server_match(const struct qrtr_server *srv,
@@ -196,8 +234,8 @@ static int service_announce_new(u32 endpoint_id, struct sockaddr_qrtr *dest,
 	return qrtr_ns_sendmsg(endpoint_id, dest, &pkt);
 }
 
-static int service_announce_del(u32 endpoint_id, struct sockaddr_qrtr *dest,
-				struct qrtr_server *srv)
+static void service_announce_del(u32 endpoint_id, struct sockaddr_qrtr *dest,
+				 struct qrtr_server *srv)
 {
 	struct qrtr_ctrl_pkt pkt;
 	int ret;
@@ -216,7 +254,7 @@ static int service_announce_del(u32 endpoint_id, struct sockaddr_qrtr *dest,
 	if (ret < 0 && ret != -ENODEV)
 		pr_err("failed to announce del service\n");
 
-	return ret;
+	return;
 }
 
 static void lookup_notify(u32 endpoint_id, struct sockaddr_qrtr *to,
@@ -263,6 +301,7 @@ static int announce_servers(u32 endpoint_id, struct sockaddr_qrtr *sq)
 		if (ret < 0) {
 			if (ret == -ENODEV)
 				continue;
+
 			pr_err("failed to announce new service\n");
 			return ret;
 		}
@@ -283,6 +322,17 @@ static struct qrtr_server *server_add(u32 endpoint_id,
 	if (!service || !port)
 		return NULL;
 
+	node = node_get(endpoint_id, node_id);
+	if (!node)
+		return NULL;
+
+	/* Make sure the new servers per port are capped at the maximum value */
+	old = xa_load(&node->servers, port);
+	if (!old && node->server_count >= QRTR_NS_MAX_SERVERS) {
+		pr_err_ratelimited("QRTR client node %u exceeds max server limit!\n", node_id);
+		return NULL;
+	}
+
 	srv = kzalloc(sizeof(*srv), GFP_KERNEL);
 	if (!srv)
 		return NULL;
@@ -291,10 +341,6 @@ static struct qrtr_server *server_add(u32 endpoint_id,
 	srv->instance = instance;
 	srv->node = node_id;
 	srv->port = port;
-
-	node = node_new(endpoint_id, node_id);
-	if (!node)
-		goto err;
 
 	/* Delete the old server on the same port */
 	old = xa_store(&node->servers, port, srv, GFP_KERNEL);
@@ -306,6 +352,8 @@ static struct qrtr_server *server_add(u32 endpoint_id,
 		} else {
 			kfree(old);
 		}
+	} else {
+		node->server_count++;
 	}
 
 	trace_qrtr_ns_server_add(srv->service, srv->instance,
@@ -348,6 +396,7 @@ static int server_del(u32 endpoint_id, struct qrtr_node *node,
 	}
 
 	kfree(srv);
+	node->server_count--;
 
 	return 0;
 }
@@ -388,9 +437,9 @@ static int ctrl_cmd_bye(u32 endpoint_id, struct sockaddr_qrtr *from)
 	struct sockaddr_qrtr sq;
 	struct qrtr_node *node;
 	unsigned long index;
-	int ret;
+	int ret = 0;
 
-	node = node_lookup(endpoint_id, from->sq_node);
+	node = node_get(endpoint_id, from->sq_node);
 	if (!node)
 		return 0;
 
@@ -399,9 +448,11 @@ static int ctrl_cmd_bye(u32 endpoint_id, struct sockaddr_qrtr *from)
 		server_del(endpoint_id, node, srv->port, true);
 
 	/* Advertise the removal of this client to all local servers */
-	local_node = node_lookup(qrtr_ns.local_node, qrtr_ns.local_node);
-	if (!local_node)
-		return 0;
+	local_node = node_get(qrtr_ns.local_node, qrtr_ns.local_node);
+	if (!local_node) {
+		ret = 0;
+		goto delete_node;
+	}
 
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.cmd = cpu_to_le32(QRTR_TYPE_BYE);
@@ -416,10 +467,17 @@ static int ctrl_cmd_bye(u32 endpoint_id, struct sockaddr_qrtr *from)
 		ret = qrtr_ns_sendmsg(endpoint_id, &sq, &pkt);
 		if (ret < 0 && ret != -ENODEV) {
 			pr_err("failed to send bye cmd\n");
-			return ret;
+			goto delete_node;
 		}
 	}
-	return 0;
+
+	/* Ignore -ENODEV */
+	ret = 0;
+
+delete_node:
+	node_erase(endpoint_id, from->sq_node);
+
+	return ret;
 }
 
 static int ctrl_cmd_del_client(u32 endpoint_id, struct sockaddr_qrtr *from,
@@ -454,6 +512,7 @@ static int ctrl_cmd_del_client(u32 endpoint_id, struct sockaddr_qrtr *from,
 
 		list_del(&lookup->li);
 		kfree(lookup);
+		qrtr_ns.lookup_count--;
 	}
 
 	/* Remove the server belonging to this port but don't broadcast
@@ -571,6 +630,11 @@ static int ctrl_cmd_new_lookup(u32 endpoint_id, struct sockaddr_qrtr *from,
 	if (from->sq_node != qrtr_ns.local_node)
 		return -EINVAL;
 
+	if (qrtr_ns.lookup_count >= QRTR_NS_MAX_LOOKUPS) {
+		pr_err_ratelimited("QRTR client node exceeds max lookup limit!\n");
+		return -ENOSPC;
+	}
+
 	lookup = kzalloc(sizeof(*lookup), GFP_KERNEL);
 	if (!lookup)
 		return -ENOMEM;
@@ -579,6 +643,7 @@ static int ctrl_cmd_new_lookup(u32 endpoint_id, struct sockaddr_qrtr *from,
 	lookup->service = service;
 	lookup->instance = instance;
 	list_add_tail(&lookup->li, &qrtr_ns.lookups);
+	qrtr_ns.lookup_count++;
 
 	memset(&filter, 0, sizeof(filter));
 	filter.service = service;
@@ -627,6 +692,7 @@ static void ctrl_cmd_del_lookup(u32 endpoint_id, struct sockaddr_qrtr *from,
 
 		list_del(&lookup->li);
 		kfree(lookup);
+		qrtr_ns.lookup_count--;
 	}
 }
 
@@ -733,7 +799,7 @@ static void qrtr_ns_worker(struct work_struct *work)
 		}
 
 		if (ret < 0)
-			pr_err("failed while handling packet from %d:%d",
+			pr_err_ratelimited("failed while handling packet from %d:%d",
 			       sq.sq_node, sq.sq_port);
 	}
 
@@ -774,6 +840,7 @@ int qrtr_ns_init(void)
 		goto err_sock;
 	}
 
+	qrtr_ns.saved_data_ready = qrtr_ns.sock->sk->sk_data_ready;
 	qrtr_ns.sock->sk->sk_data_ready = qrtr_ns_data_ready;
 
 	sq.sq_port = QRTR_PORT_CTRL;
@@ -793,9 +860,31 @@ int qrtr_ns_init(void)
 	if (ret < 0)
 		goto err_wq;
 
+	/* As the qrtr ns socket owner and creator is the same module, we have
+	 * to decrease the qrtr module reference count to guarantee that it
+	 * remains zero after the ns socket is created, otherwise, executing
+	 * "rmmod" command is unable to make the qrtr module deleted after the
+	 *  qrtr module is inserted successfully.
+	 *
+	 * However, the reference count is increased twice in
+	 * sock_create_kern(): one is to increase the reference count of owner
+	 * of qrtr socket's proto_ops struct; another is to increment the
+	 * reference count of owner of qrtr proto struct. Therefore, we must
+	 * decrement the module reference count twice to ensure that it keeps
+	 * zero after server's listening socket is created. Of course, we
+	 * must bump the module reference count twice as well before the socket
+	 * is closed.
+	 */
+	module_put(qrtr_ns.sock->ops->owner);
+	module_put(qrtr_ns.sock->sk->sk_prot_creator->owner);
+
 	return 0;
 
 err_wq:
+	write_lock_bh(&qrtr_ns.sock->sk->sk_callback_lock);
+	qrtr_ns.sock->sk->sk_data_ready = qrtr_ns.saved_data_ready;
+	write_unlock_bh(&qrtr_ns.sock->sk->sk_callback_lock);
+
 	destroy_workqueue(qrtr_ns.workqueue);
 err_sock:
 	sock_release(qrtr_ns.sock);
@@ -805,8 +894,22 @@ EXPORT_SYMBOL_GPL(qrtr_ns_init);
 
 void qrtr_ns_remove(void)
 {
+	write_lock_bh(&qrtr_ns.sock->sk->sk_callback_lock);
+	qrtr_ns.sock->sk->sk_data_ready = qrtr_ns.saved_data_ready;
+	write_unlock_bh(&qrtr_ns.sock->sk->sk_callback_lock);
+
 	cancel_work_sync(&qrtr_ns.work);
+	synchronize_net();
 	destroy_workqueue(qrtr_ns.workqueue);
+
+	/* sock_release() expects the two references that were put during
+	 * qrtr_ns_init(). This function is only called during module remove,
+	 * so try_stop_module() has already set the refcnt to 0. Use
+	 * __module_get() instead of try_module_get() to successfully take two
+	 * references.
+	 */
+	__module_get(qrtr_ns.sock->ops->owner);
+	__module_get(qrtr_ns.sock->sk->sk_prot_creator->owner);
 	sock_release(qrtr_ns.sock);
 }
 EXPORT_SYMBOL_GPL(qrtr_ns_remove);

@@ -10,6 +10,15 @@ struct sk_buff;
 #define QRTR_EP_NID_AUTO (-1)
 
 /**
+ * struct qrtr_node_lookup_helper - node lookup helper, stored in qrtr_nodes
+ * @nodes: nodes, indexed by node_id
+ */
+struct qrtr_node_lookup_helper {
+	int added;
+	struct radix_tree_root nodes;
+};
+
+/**
  * struct qrtr_endpoint - endpoint handle
  * @xmit: Callback for outgoing packets
  * @endpoint_data: endpoint-specific data pointer, can be NULL
@@ -26,6 +35,7 @@ struct qrtr_endpoint {
 	void *endpoint_data;
 	/* private: not for endpoint use */
 	struct qrtr_node *node;
+	struct qrtr_node_lookup_helper helper;
 	u32 id;
 };
 

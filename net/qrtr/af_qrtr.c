@@ -162,7 +162,7 @@ static u32 next_endpoint_id;
 /* local port allocation management */
 static DEFINE_XARRAY_ALLOC(qrtr_ports);
 
-/* The radix tree API uses fixed unsigned long keys and we will have to make
+/* The xarray API uses fixed unsigned long keys and we will have to make
  * do with that.
  * These keys are often a combination of node IDs and port numbers or
  * endpoint IDs and node IDs (all currently u32).
@@ -174,7 +174,8 @@ static DEFINE_XARRAY_ALLOC(qrtr_ports);
  * node/endpoint IDs and the lower bits to the port number/node ID, however
  * big that may be.
  */
-#define QRTR_INDEX_HALF_BITS (RADIX_TREE_INDEX_BITS >> 1)
+#define QRTR_XARRAY_INDEX_BITS  (8 /* CHAR_BIT */ * sizeof(unsigned long))
+#define QRTR_INDEX_HALF_BITS (QRTR_XARRAY_INDEX_BITS >> 1)
 
 #define QRTR_INDEX_HALF_UNSIGNED_MAX ((~(unsigned long)(0)) >> QRTR_INDEX_HALF_BITS)
 #define QRTR_INDEX_HALF_UNSIGNED_MIN ((unsigned long)(0))
@@ -182,14 +183,16 @@ static DEFINE_XARRAY_ALLOC(qrtr_ports);
 #define QRTR_INDEX_HALF_SIGNED_MAX ((long)(QRTR_INDEX_HALF_UNSIGNED_MAX) >> 1)
 #define QRTR_INDEX_HALF_SIGNED_MIN ((long)(-1) - QRTR_INDEX_HALF_SIGNED_MAX)
 
+/* endpoint not defined, i.e. endpoint 0 */
+struct qrtr_node_lookup_helper helper0;
+
 /**
  * struct qrtr_node - endpoint node
  * @ep_lock: lock for endpoint management and callbacks
  * @ep: endpoint
  * @ref: reference count for node
  * @nid: node id
- * @qrtr_tx_flow: tree of qrtr_tx_flow, keyed by
- *                node << QRTR_INDEX_HALF_BITS | port
+ * @qrtr_tx_flow: xarray of qrtr_tx_flow, keyed by node << 32 | port
  * @qrtr_tx_lock: lock for qrtr_tx_flow inserts
  * @rx_queue: receive queue
  * @item: list item for broadcast list
@@ -200,7 +203,7 @@ struct qrtr_node {
 	struct kref ref;
 	unsigned int nid;
 
-	struct radix_tree_root qrtr_tx_flow;
+	struct xarray qrtr_tx_flow;
 	struct mutex qrtr_tx_lock; /* for qrtr_tx_flow */
 
 	struct sk_buff_head rx_queue;
@@ -242,17 +245,29 @@ static void __qrtr_node_release(struct kref *kref)
 {
 	struct qrtr_node *node = container_of(kref, struct qrtr_node, ref);
 	struct radix_tree_iter iter;
+	struct radix_tree_iter iter2;
 	struct qrtr_tx_flow *flow;
 	unsigned long flags;
 	void __rcu **slot;
+	void __rcu **slot2;
+	unsigned long index;
 
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 	/* If the node is a bridge for other nodes, there are possibly
 	 * multiple entries pointing to our released node, delete them all.
 	 */
 	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
-		if (*slot == node)
+		struct qrtr_node_lookup_helper *helper = *slot;
+		if (!helper)
+			continue;
+		radix_tree_for_each_slot(slot2, &helper->nodes, &iter2, 0) {
+			if (*slot2 == node)
+				radix_tree_iter_delete(&helper->nodes, &iter2, slot2);
+		}
+		if (helper != &helper0 && radix_tree_empty(&helper->nodes)) {
 			radix_tree_iter_delete(&qrtr_nodes, &iter, slot);
+			helper->added = 0;
+		}
 	}
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 
@@ -262,11 +277,9 @@ static void __qrtr_node_release(struct kref *kref)
 	skb_queue_purge(&node->rx_queue);
 
 	/* Free tx flow counters */
-	radix_tree_for_each_slot(slot, &node->qrtr_tx_flow, &iter, 0) {
-		flow = *slot;
-		radix_tree_iter_delete(&node->qrtr_tx_flow, &iter, slot);
+	xa_for_each(&node->qrtr_tx_flow, index, flow)
 		kfree(flow);
-	}
+	xa_destroy(&node->qrtr_tx_flow);
 	kfree(node);
 }
 
@@ -308,9 +321,7 @@ static int qrtr_tx_resume(struct qrtr_node *node, struct sk_buff *skb)
 	key = ((unsigned long)(remote_node) << QRTR_INDEX_HALF_BITS) |
 	      ((unsigned long)(remote_port) & QRTR_INDEX_HALF_UNSIGNED_MAX);
 
-	rcu_read_lock();
-	flow = radix_tree_lookup(&node->qrtr_tx_flow, key);
-	rcu_read_unlock();
+	flow = xa_load(&node->qrtr_tx_flow, key);
 	if (flow) {
 		spin_lock(&flow->resume_tx.lock);
 		flow->pending = 0;
@@ -346,11 +357,14 @@ static int qrtr_tx_wait(struct qrtr_node *node, int dest_node, int dest_port,
 	int confirm_rx = 0;
 	int ret;
 
-	if (dest_node < QRTR_INDEX_HALF_SIGNED_MIN ||
-	    dest_node > QRTR_INDEX_HALF_SIGNED_MAX ||
-	    dest_port < QRTR_INDEX_HALF_SIGNED_MIN ||
+	/* Don't check node for the valid range. It's a single value
+	 * hardcoded in firmware. Using only low 16 bits is enough.
+	 */
+	if (dest_port < QRTR_INDEX_HALF_SIGNED_MIN ||
 	    dest_port > QRTR_INDEX_HALF_SIGNED_MAX)
 		return -EINVAL;
+
+	dest_node &= QRTR_INDEX_HALF_UNSIGNED_MAX;
 
 	key = ((unsigned long)(dest_node) << QRTR_INDEX_HALF_BITS) |
 	      ((unsigned long)(dest_port) & QRTR_INDEX_HALF_UNSIGNED_MAX);
@@ -360,12 +374,13 @@ static int qrtr_tx_wait(struct qrtr_node *node, int dest_node, int dest_port,
 		return 0;
 
 	mutex_lock(&node->qrtr_tx_lock);
-	flow = radix_tree_lookup(&node->qrtr_tx_flow, key);
+	flow = xa_load(&node->qrtr_tx_flow, key);
 	if (!flow) {
 		flow = kzalloc(sizeof(*flow), GFP_KERNEL);
 		if (flow) {
 			init_waitqueue_head(&flow->resume_tx);
-			if (radix_tree_insert(&node->qrtr_tx_flow, key, flow)) {
+			if (xa_err(xa_store(&node->qrtr_tx_flow, key, flow,
+					    GFP_KERNEL))) {
 				kfree(flow);
 				flow = NULL;
 			}
@@ -419,18 +434,19 @@ static int qrtr_tx_flow_failed(struct qrtr_node *node, int dest_node,
 	unsigned long key = 0;
 	struct qrtr_tx_flow *flow;
 
-	if (dest_node < QRTR_INDEX_HALF_SIGNED_MIN ||
-	    dest_node > QRTR_INDEX_HALF_SIGNED_MAX ||
-	    dest_port < QRTR_INDEX_HALF_SIGNED_MIN ||
+	/* Don't check node for the valid range. It's a single value
+	 * hardcoded in firmware. Using only low 16 bits is enough.
+	 */
+	if (dest_port < QRTR_INDEX_HALF_SIGNED_MIN ||
 	    dest_port > QRTR_INDEX_HALF_SIGNED_MAX)
 		return -EINVAL;
+
+	dest_node &= QRTR_INDEX_HALF_UNSIGNED_MAX;
 
 	key = ((unsigned long)(dest_node) << QRTR_INDEX_HALF_BITS) |
 	      ((unsigned long)(dest_port) & QRTR_INDEX_HALF_UNSIGNED_MAX);
 
-	rcu_read_lock();
-	flow = radix_tree_lookup(&node->qrtr_tx_flow, key);
-	rcu_read_unlock();
+	flow = xa_load(&node->qrtr_tx_flow, key);
 	if (flow) {
 		spin_lock_irq(&flow->resume_tx.lock);
 		flow->tx_failed = 1;
@@ -470,7 +486,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 	}
 
 	hdr->size = cpu_to_le32(len);
-	hdr->confirm_rx = !!confirm_rx;
+	hdr->confirm_rx = cpu_to_le32(!!confirm_rx);
 
 	rc = skb_put_padto(skb, ALIGN(len, 4) + sizeof(*hdr));
 
@@ -499,19 +515,14 @@ static struct qrtr_node *qrtr_node_lookup(unsigned int endpoint_id,
 					  unsigned int nid)
 {
 	struct qrtr_node *node = NULL;
+	struct qrtr_node_lookup_helper *helper = NULL;
 	unsigned long flags;
-	unsigned long key = 0;
-
-	if (endpoint_id > QRTR_INDEX_HALF_UNSIGNED_MAX ||
-	    nid > QRTR_INDEX_HALF_UNSIGNED_MAX)
-		return node;
-
-	key = ((unsigned long)(endpoint_id) << QRTR_INDEX_HALF_BITS) |
-	      ((unsigned long)(nid) & QRTR_INDEX_HALF_UNSIGNED_MAX);
 
 	mutex_lock(&qrtr_node_lock);
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
-	node = radix_tree_lookup(&qrtr_nodes, key);
+	helper = radix_tree_lookup(&qrtr_nodes, endpoint_id);
+	if (helper)
+		node = radix_tree_lookup(&helper->nodes, nid);
 	node = qrtr_node_acquire(node);
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 	mutex_unlock(&qrtr_node_lock);
@@ -528,25 +539,23 @@ static struct qrtr_node *qrtr_node_lookup(unsigned int endpoint_id,
  */
 static int qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
 {
+	struct qrtr_node_lookup_helper *helper;
 	unsigned long flags;
-	unsigned long key;
 
 	if (nid == QRTR_EP_NID_AUTO)
 		return 0;
 
-	if (node->ep->id > QRTR_INDEX_HALF_UNSIGNED_MAX ||
-	    nid > QRTR_INDEX_HALF_UNSIGNED_MAX)
-		return -EINVAL;
-
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 
-	/* Always insert with the endpoint_id + node_id */
-	key = ((unsigned long)(node->ep->id) << QRTR_INDEX_HALF_BITS) |
-	      ((unsigned long)(nid) & QRTR_INDEX_HALF_UNSIGNED_MAX);
-	radix_tree_insert(&qrtr_nodes, key, node);
-
-	if (!radix_tree_lookup(&qrtr_nodes, nid))
-		radix_tree_insert(&qrtr_nodes, nid, node);
+	helper = &helper0;
+	if (!radix_tree_lookup(&helper->nodes, nid))
+		radix_tree_insert(&helper->nodes, nid, node);
+	if (!node->ep->helper.added) {
+		INIT_RADIX_TREE(&node->ep->helper.nodes, GFP_ATOMIC);
+		radix_tree_insert(&qrtr_nodes, node->ep->id, &node->ep->helper);
+		node->ep->helper.added = 1;
+	}
+	radix_tree_insert(&node->ep->helper.nodes, nid, node);
 
 	if (node->nid == QRTR_EP_NID_AUTO)
 		node->nid = nid;
@@ -598,7 +607,7 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		cb->type = le32_to_cpu(v1->type);
 		cb->src_node = le32_to_cpu(v1->src_node_id);
 		cb->src_port = le32_to_cpu(v1->src_port_id);
-		cb->confirm_rx = !!v1->confirm_rx;
+		cb->confirm_rx = !!le32_to_cpu(v1->confirm_rx);
 		cb->dst_node = le32_to_cpu(v1->dst_node_id);
 		cb->dst_port = le32_to_cpu(v1->dst_port_id);
 
@@ -634,7 +643,7 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 
 	cb->endpoint_id = ep->id;
 
-	if (!size || len != ALIGN(size, 4) + hdrlen)
+	if (!size || size > len || len != ALIGN(size, 4) + hdrlen)
 		goto err;
 
 	/* Don't allow remote lookups */
@@ -877,7 +886,7 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	node->nid = QRTR_EP_NID_AUTO;
 	node->ep = ep;
 
-	INIT_RADIX_TREE(&node->qrtr_tx_flow, GFP_KERNEL);
+	xa_init(&node->qrtr_tx_flow);
 	mutex_init(&node->qrtr_tx_lock);
 
 	rc = qrtr_node_assign(node, nid);
@@ -889,6 +898,7 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	mutex_unlock(&qrtr_node_lock);
 	ep->node = node;
 	ep->id = endpoint_id;
+	ep->helper.added = 0;
 
 	return 0;
 free_node:
@@ -907,11 +917,14 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
 	struct sockaddr_qrtr src = {AF_QIPCRTR, node->nid, QRTR_PORT_CTRL};
 	struct sockaddr_qrtr dst = {AF_QIPCRTR, qrtr_local_nid, QRTR_PORT_CTRL};
 	struct radix_tree_iter iter;
+	struct radix_tree_iter iter2;
 	struct qrtr_ctrl_pkt *pkt;
 	struct qrtr_tx_flow *flow;
 	struct sk_buff *skb;
 	unsigned long flags;
+	unsigned long index;
 	void __rcu **slot;
+	void __rcu **slot2;
 	u32 endpoint_id;
 
 	mutex_lock(&node->ep_lock);
@@ -922,24 +935,33 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
 	/* Notify the local controller about the event */
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
-		if (*slot != node)
+		struct qrtr_node_lookup_helper *helper = *slot;
+		if (!helper)
 			continue;
-		src.sq_node = iter.index;
-		skb = qrtr_alloc_ctrl_packet(&pkt, GFP_ATOMIC);
-		if (skb) {
-			pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
-			qrtr_local_enqueue(NULL, skb, endpoint_id,
-					   QRTR_TYPE_BYE, &src, &dst);
+		radix_tree_for_each_slot(slot2, &helper->nodes, &iter2, 0) {
+			if (*slot2 != node)
+				continue;
+			src.sq_node = iter.index;
+			skb = qrtr_alloc_ctrl_packet(&pkt, GFP_ATOMIC);
+			if (skb) {
+				pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
+				qrtr_local_enqueue(NULL, skb, endpoint_id,
+						   QRTR_TYPE_BYE, &src, &dst);
+			}
 		}
+	}
+	if (ep->helper.added) {
+		radix_tree_for_each_slot(slot, &ep->helper.nodes, &iter, 0)
+			radix_tree_iter_delete(&ep->helper.nodes, &iter, slot);
+		radix_tree_delete(&qrtr_nodes, ep->id);
+		ep->helper.added = 0;
 	}
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
 
 	/* Wake up any transmitters waiting for resume-tx from the node */
 	mutex_lock(&node->qrtr_tx_lock);
-	radix_tree_for_each_slot(slot, &node->qrtr_tx_flow, &iter, 0) {
-		flow = *slot;
+	xa_for_each(&node->qrtr_tx_flow, index, flow)
 		wake_up_interruptible_all(&flow->resume_tx);
-	}
 	mutex_unlock(&node->qrtr_tx_lock);
 
 	qrtr_node_release(node);
@@ -1003,13 +1025,13 @@ static void qrtr_port_remove(struct qrtr_sock *ipc)
 	if (port == QRTR_PORT_CTRL)
 		port = 0;
 
-	__sock_put(&ipc->sk);
-
 	xa_erase(&qrtr_ports, port);
 
 	/* Ensure that if qrtr_port_lookup() did enter the RCU read section we
 	 * wait for it to up increment the refcount */
 	synchronize_rcu();
+
+	__sock_put(&ipc->sk);
 }
 
 /* Assign port number to socket.
@@ -1190,7 +1212,7 @@ static int qrtr_bcast_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 
 	mutex_lock(&qrtr_node_lock);
 	list_for_each_entry(node, &qrtr_all_nodes, item) {
-		skbn = skb_clone(skb, GFP_KERNEL);
+		skbn = pskb_copy(skb, GFP_KERNEL);
 		if (!skbn)
 			break;
 		skb_set_owner_w(skbn, skb->sk);
@@ -1333,8 +1355,10 @@ static int qrtr_send_resume_tx(struct qrtr_cb *cb)
 		return -EINVAL;
 
 	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
-	if (!skb)
+	if (!skb) {
+		qrtr_node_release(node);
 		return -ENOMEM;
+	}
 
 	pkt->cmd = cpu_to_le32(QRTR_TYPE_RESUME_TX);
 	pkt->client.node = cpu_to_le32(cb->dst_node);
@@ -1661,6 +1685,14 @@ static int qrtr_create(struct net *net, struct socket *sock,
 	if (sock->type != SOCK_DGRAM)
 		return -EPROTOTYPE;
 
+	/* QRTR keeps its port and node state in module-global variables that
+	 * are not partitioned per network namespace, and the in-kernel name
+	 * service only operates in init_net. Confine the family to init_net so
+	 * a socket in another namespace cannot reach the global control plane.
+	 */
+	if (!net_eq(net, &init_net))
+		return -EAFNOSUPPORT;
+
 	sk = sk_alloc(net, AF_QIPCRTR, GFP_KERNEL, &qrtr_proto, kern);
 	if (!sk)
 		return -ENOMEM;
@@ -1700,8 +1732,14 @@ static int __init qrtr_proto_init(void)
 	if (rc)
 		goto err_sock;
 
+	rc = radix_tree_insert(&qrtr_nodes, 0, &helper0);
+	if (rc)
+		goto err_ns;
+
 	return 0;
 
+err_ns:
+	qrtr_ns_remove();
 err_sock:
 	sock_unregister(qrtr_family.family);
 err_proto:
@@ -1712,6 +1750,7 @@ postcore_initcall(qrtr_proto_init);
 
 static void __exit qrtr_proto_fini(void)
 {
+	radix_tree_delete(&qrtr_nodes, 0);
 	qrtr_ns_remove();
 	sock_unregister(qrtr_family.family);
 	proto_unregister(&qrtr_proto);
