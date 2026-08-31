@@ -1736,6 +1736,9 @@ static int __init qrtr_proto_init(void)
 	if (rc)
 		goto err_ns;
 
+	INIT_RADIX_TREE(&helper0.nodes, GFP_ATOMIC);
+	helper0.added = 1;
+
 	return 0;
 
 err_ns:
