@@ -947,6 +947,9 @@ int mhi_register_controller(struct mhi_controller *mhi_cntrl,
 	rwlock_init(&mhi_cntrl->pm_lock);
 	spin_lock_init(&mhi_cntrl->transition_lock);
 	spin_lock_init(&mhi_cntrl->wlock);
+	spin_lock_init(&mhi_cntrl->qrtr_endpoint_lock);
+	mhi_cntrl->qrtr_endpoint_id = 0;
+	mhi_cntrl->free_qrtr_endpoint_id = NULL;
 	INIT_WORK(&mhi_cntrl->st_worker, mhi_pm_st_worker);
 	init_waitqueue_head(&mhi_cntrl->state_event);
 
@@ -1085,6 +1088,11 @@ void mhi_unregister_controller(struct mhi_controller *mhi_cntrl)
 	put_device(&mhi_dev->dev);
 
 	ida_free(&mhi_controller_ida, mhi_cntrl->index);
+
+	spin_lock(&mhi_cntrl->qrtr_endpoint_lock);
+	if (mhi_cntrl->free_qrtr_endpoint_id)
+		mhi_cntrl->free_qrtr_endpoint_id(mhi_cntrl);
+	spin_unlock(&mhi_cntrl->qrtr_endpoint_lock);
 }
 EXPORT_SYMBOL_GPL(mhi_unregister_controller);
 
