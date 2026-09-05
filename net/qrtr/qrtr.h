@@ -21,6 +21,7 @@ struct qrtr_node_lookup_helper {
 /**
  * struct qrtr_endpoint - endpoint handle
  * @xmit: Callback for outgoing packets
+ * @endpoint_data_id: an already allocated id to be used instead of new alloc
  *
  * The socket buffer passed to the xmit function becomes owned by the endpoint
  * driver.  As such, when the driver is done with the buffer, it should
@@ -32,6 +33,7 @@ struct qrtr_endpoint {
 	struct qrtr_node *node;
 	struct qrtr_node_lookup_helper helper;
 	u32 id;
+	u32 endpoint_data_id;
 };
 
 int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid);
