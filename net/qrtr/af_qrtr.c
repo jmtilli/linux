@@ -11,6 +11,7 @@
 #include <linux/wait.h>
 
 #include <net/sock.h>
+#include <net/qrtr.h>
 
 #include "qrtr.h"
 
@@ -753,8 +754,8 @@ static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt,
 int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 {
 	struct qrtr_node *node;
-	u32 endpoint_id;
-	int rc;
+	u32 endpoint_id = 0;
+	int rc = 0;
 
 	if (!ep || !ep->xmit)
 		return -EINVAL;
@@ -763,9 +764,18 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	if (!node)
 		return -ENOMEM;
 
-	rc = xa_alloc_cyclic(&qrtr_endpoints, &endpoint_id, NULL,
-			     QRTR_ENDPOINT_RANGE, &next_endpoint_id,
-			     GFP_KERNEL);
+	if (ep->endpoint_data_id)
+		endpoint_id = ep->endpoint_data_id;
+
+	/*
+	 * If we're registering an endpoint into smd or tun based qrtr,
+	 * we don't have endpoint_data_id. Thus, allocate a new one.
+	 */
+	if (!endpoint_id) {
+		rc = xa_alloc_cyclic(&qrtr_endpoints, &endpoint_id, NULL,
+				     QRTR_ENDPOINT_RANGE, &next_endpoint_id,
+				     GFP_KERNEL);
+	}
 
 	if (rc < 0)
 		goto free_node;
@@ -857,12 +867,32 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
 
 	qrtr_node_release(node);
 
-	xa_erase(&qrtr_endpoints, endpoint_id);
+	if (ep->endpoint_data_id != endpoint_id)
+		xa_erase(&qrtr_endpoints, endpoint_id); // did allocate
 
 	ep->id = 0;
 	ep->node = NULL;
 }
 EXPORT_SYMBOL_GPL(qrtr_endpoint_unregister);
+
+int qrtr_endpoint_get_data_id(u32 *endpoint_id)
+{
+	int rc;
+
+	*endpoint_id = 0;
+	// GFP_ATOMIC to allow while holding spinlock
+	rc = xa_alloc_cyclic(&qrtr_endpoints, endpoint_id, NULL,
+			     QRTR_ENDPOINT_RANGE, &next_endpoint_id,
+			     GFP_ATOMIC);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qrtr_endpoint_get_data_id);
+
+void qrtr_endpoint_free_data_id(u32 endpoint_id)
+{
+	xa_erase(&qrtr_endpoints, endpoint_id);
+}
+EXPORT_SYMBOL_GPL(qrtr_endpoint_free_data_id);
 
 /* Lookup socket by port.
  *
