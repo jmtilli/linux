@@ -116,6 +116,17 @@ static ssize_t endpoint_show(struct device *dev,
 
 static DEVICE_ATTR_RO(endpoint);
 
+static void qcom_mhi_qrtr_free_mhi_id(void *mhi_cntrl_void)
+{
+	struct mhi_controller *mhi_cntrl = mhi_cntrl_void;
+	u32 id = mhi_cntrl->qrtr_endpoint_id;
+
+	if (id != 0)
+		qrtr_endpoint_free_data_id(id);
+	mhi_cntrl->qrtr_endpoint_id = 0;
+	mhi_cntrl->free_qrtr_endpoint_id = NULL;
+}
+
 static int qcom_mhi_qrtr_probe(struct mhi_device *mhi_dev,
 			       const struct mhi_device_id *id)
 {
@@ -129,6 +140,23 @@ static int qcom_mhi_qrtr_probe(struct mhi_device *mhi_dev,
 	qdev->mhi_dev = mhi_dev;
 	qdev->dev = &mhi_dev->dev;
 	qdev->ep.xmit = qcom_mhi_qrtr_send;
+
+	spin_lock(&mhi_dev->mhi_cntrl->qrtr_endpoint_lock);
+	if (mhi_dev->mhi_cntrl->qrtr_endpoint_id)
+		qdev->ep.endpoint_data_id =
+			mhi_dev->mhi_cntrl->qrtr_endpoint_id;
+	else {
+		rc = qrtr_endpoint_get_data_id(&qdev->ep.endpoint_data_id);
+		if (rc) {
+			spin_unlock(&mhi_dev->mhi_cntrl->qrtr_endpoint_lock);
+			return -ENOMEM;
+		}
+		mhi_dev->mhi_cntrl->qrtr_endpoint_id =
+			qdev->ep.endpoint_data_id;
+		mhi_dev->mhi_cntrl->free_qrtr_endpoint_id =
+			qcom_mhi_qrtr_free_mhi_id;
+	}
+	spin_unlock(&mhi_dev->mhi_cntrl->qrtr_endpoint_lock);
 
 	dev_set_drvdata(&mhi_dev->dev, qdev);
 
@@ -149,6 +177,9 @@ static int qcom_mhi_qrtr_probe(struct mhi_device *mhi_dev,
 		dev_err(qdev->dev, "Failed to create endpoint attribute\n");
 
 	dev_dbg(qdev->dev, "Qualcomm MHI QRTR driver probed\n");
+
+	mhi_dev->mhi_cntrl->qrtr_endpoint_id = qdev->ep.id;
+	mhi_dev->mhi_cntrl->free_qrtr_endpoint_id = qcom_mhi_qrtr_free_mhi_id;
 
 	return 0;
 
