@@ -358,6 +358,7 @@ struct mhi_controller_config {
  * @st_worker: State transition worker
  * @hiprio_wq: High priority workqueue for MHI work such as state transitions
  * @state_event: State change event
+ * @qrtr_endpoint_id: The QRTR endpoint id associated with this MHI controller
  * @status_cb: CB function to notify power states of the device (required)
  * @wake_get: CB function to assert device wake (optional)
  * @wake_put: CB function to de-assert device wake (optional)
@@ -370,6 +371,7 @@ struct mhi_controller_config {
  * @write_reg: Write a MHI register via the physical link (required)
  * @reset: Controller specific reset function (optional)
  * @edl_trigger: CB function to trigger EDL mode (optional)
+ * @free_qrtr_endpoint_id: Function to free the QRTR endpoint id
  * @buffer_len: Bounce buffer length
  * @index: Index of the MHI controller instance
  * @bounce_buf: Use of bounce buffer
@@ -436,6 +438,8 @@ struct mhi_controller {
 	struct work_struct st_worker;
 	struct workqueue_struct *hiprio_wq;
 	wait_queue_head_t state_event;
+	u32 qrtr_endpoint_id;
+	spinlock_t qrtr_endpoint_lock;
 
 	void (*status_cb)(struct mhi_controller *mhi_cntrl,
 			  enum mhi_callback cb);
@@ -454,6 +458,7 @@ struct mhi_controller {
 			  u32 val);
 	void (*reset)(struct mhi_controller *mhi_cntrl);
 	int (*edl_trigger)(struct mhi_controller *mhi_cntrl);
+	void (*free_qrtr_endpoint_id)(void *mhi_cntrl_void);
 
 	size_t buffer_len;
 	int index;
