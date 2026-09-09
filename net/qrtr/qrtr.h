@@ -10,8 +10,18 @@ struct sk_buff;
 #define QRTR_EP_NID_AUTO (-1)
 
 /**
+ * struct qrtr_node_lookup_helper - node lookup helper, stored in qrtr_nodes
+ * @nodes: nodes, indexed by node_id
+ */
+struct qrtr_node_lookup_helper {
+	int added;
+	struct radix_tree_root nodes;
+};
+
+/**
  * struct qrtr_endpoint - endpoint handle
  * @xmit: Callback for outgoing packets
+ * @endpoint_data_id: an already allocated id to be used instead of new alloc
  *
  * The socket buffer passed to the xmit function becomes owned by the endpoint
  * driver.  As such, when the driver is done with the buffer, it should
@@ -21,6 +31,9 @@ struct qrtr_endpoint {
 	int (*xmit)(struct qrtr_endpoint *ep, struct sk_buff *skb);
 	/* private: not for endpoint use */
 	struct qrtr_node *node;
+	struct qrtr_node_lookup_helper helper;
+	u32 id;
+	u32 endpoint_data_id;
 };
 
 int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid);
@@ -32,5 +45,11 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len);
 int qrtr_ns_init(void);
 
 void qrtr_ns_remove(void);
+
+int qrtr_msg_get_endpoint(struct msghdr *msg, u32 *out_endpoint_id);
+void qrtr_sock_set_report_endpoint(struct sock *sk);
+
+int qrtr_endpoint_get_data_id(u32 *endpoint_id);
+void qrtr_endpoint_free_data_id(u32 endpoint_id);
 
 #endif
