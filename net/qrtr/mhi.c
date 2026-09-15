@@ -112,7 +112,7 @@ static ssize_t endpoint_show(struct device *dev,
 {
 	struct qrtr_mhi_dev *qdev = dev_get_drvdata(dev);
 
-	return sprintf(buf, "%u\n", qdev->ep.id);
+	return sysfs_emit(buf, "%u\n", qdev->ep.id);
 }
 
 static DEVICE_ATTR_RO(endpoint);
