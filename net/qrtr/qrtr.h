@@ -49,7 +49,4 @@ void qrtr_ns_remove(void);
 int qrtr_msg_get_endpoint(struct msghdr *msg, u32 *out_endpoint_id);
 void qrtr_sock_set_report_endpoint(struct sock *sk);
 
-int qrtr_endpoint_get_data_id(u32 *endpoint_id);
-void qrtr_endpoint_free_data_id(u32 endpoint_id);
-
 #endif

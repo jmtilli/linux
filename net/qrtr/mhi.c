@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
+#include <net/qrtr.h>
 
 #include "qrtr.h"
 
