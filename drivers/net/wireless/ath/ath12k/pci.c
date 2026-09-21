@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/pci.h>
+#include <net/qrtr.h>
 
 #include "pci.h"
 #include "core.h"
@@ -1170,6 +1171,13 @@ void ath12k_pci_power_down(struct ath12k_base *ab)
 	ath12k_pci_sw_reset(ab_pci->ab, false);
 }
 
+static int ath12k_pci_get_qrtr_node_id(struct ath12k_base *ab)
+{
+	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+
+	return qrtr_host_node_id(ab_pci->mhi_ctrl->index);
+}
+
 static const struct ath12k_hif_ops ath12k_pci_hif_ops = {
 	.start = ath12k_pci_start,
 	.stop = ath12k_pci_stop,
@@ -1187,6 +1195,7 @@ static const struct ath12k_hif_ops ath12k_pci_hif_ops = {
 	.ce_irq_enable = ath12k_pci_hif_ce_irq_enable,
 	.ce_irq_disable = ath12k_pci_hif_ce_irq_disable,
 	.get_ce_msi_idx = ath12k_pci_get_ce_msi_idx,
+	.get_qrtr_node_id = ath12k_pci_get_qrtr_node_id,
 };
 
 static
