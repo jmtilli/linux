@@ -464,7 +464,7 @@ static void qrtr_node_rewrite_ctrl(struct qrtr_node *node, unsigned int type,
 		return;
 
 	pkt = (struct qrtr_ctrl_pkt *)skb->data;
-	if (type == QRTR_TYPE_DEL_CLIENT)
+	if (type == QRTR_TYPE_DEL_CLIENT || type == QRTR_TYPE_RESUME_TX)
 		nid = &pkt->client.node;
 	else
 		nid = &pkt->server.node;
@@ -584,7 +584,8 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 
 	if (cb->type == QRTR_TYPE_NEW_SERVER ||
 	    cb->type == QRTR_TYPE_DEL_SERVER ||
-	    cb->type == QRTR_TYPE_DEL_CLIENT)
+	    cb->type == QRTR_TYPE_DEL_CLIENT ||
+	    cb->type == QRTR_TYPE_RESUME_TX)
 		qrtr_node_rewrite_ctrl(node, cb->type, skb);
 
 	if (cb->type == QRTR_TYPE_RESUME_TX) {
