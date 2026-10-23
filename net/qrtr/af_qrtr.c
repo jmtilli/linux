@@ -11,6 +11,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <net/qrtr.h>
 #include <net/sock.h>
 
 #include "qrtr.h"
@@ -378,7 +379,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 		/* Put back the endpoint's own node id */
 		dst_node = to->sq_node;
 		if (dst_node == READ_ONCE(node->nid))
-			dst_node = node->ep_nid;
+			dst_node = READ_ONCE(node->ep_nid);
 		hdr->dst_node_id = cpu_to_le32(dst_node);
 		hdr->dst_port_id = cpu_to_le32(to->sq_port);
 	}
@@ -429,23 +430,47 @@ static struct qrtr_node *qrtr_node_lookup(unsigned int nid)
 	return node;
 }
 
-/* Assign node id to node.
+/* Add 'nid' as a lookup key for 'node', and adopt it as the node's own id if
+ * the node does not have one yet.
  *
- * This is mostly useful for automatic node id assignment, based on
- * the source id in the incoming packet.
+ * Callers must hold 'qrtr_nodes_lock'.
+ *
+ * Return: 0 on success; negative error code on failure
  */
-static void qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
+static int __qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
 {
-	unsigned long flags;
+	int rc;
 
 	if (nid == QRTR_EP_NID_AUTO)
-		return;
+		return 0;
 
-	spin_lock_irqsave(&qrtr_nodes_lock, flags);
-	radix_tree_insert(&qrtr_nodes, nid, node);
+	if (radix_tree_lookup(&qrtr_nodes, nid) == node)
+		return 0;
+
+	rc = radix_tree_insert(&qrtr_nodes, nid, node);
+	if (rc)
+		return rc;
+
 	if (node->nid == QRTR_EP_NID_AUTO)
 		WRITE_ONCE(node->nid, nid);
+
+	return 0;
+}
+
+/* Assign node id to node.
+ *
+ * Return: 0 on success; negative error code on failure
+ */
+static int qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
+{
+	unsigned long flags;
+	int rc;
+
+	spin_lock_irqsave(&qrtr_nodes_lock, flags);
+	rc = __qrtr_node_assign(node, nid);
 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
+
+	return rc;
 }
 
 /* Replace the node id in the control packet with 'node->nid', if both are
@@ -454,13 +479,12 @@ static void qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
 static void qrtr_node_rewrite_ctrl(struct qrtr_node *node, unsigned int type,
 				   struct sk_buff *skb)
 {
+	unsigned int ep_nid = READ_ONCE(node->ep_nid);
+	unsigned int host_nid = READ_ONCE(node->nid);
 	struct qrtr_ctrl_pkt *pkt;
 	__le32 *nid;
 
-	if (node->nid == node->ep_nid)
-		return;
-
-	if (skb->len < sizeof(*pkt))
+	if (host_nid == ep_nid)
 		return;
 
 	pkt = (struct qrtr_ctrl_pkt *)skb->data;
@@ -470,8 +494,8 @@ static void qrtr_node_rewrite_ctrl(struct qrtr_node *node, unsigned int type,
 		nid = &pkt->server.node;
 
 	/* Rewrite only the endpoint's node id, not those of bridged nodes */
-	if (le32_to_cpu(*nid) == node->ep_nid)
-		*nid = cpu_to_le32(node->nid);
+	if (le32_to_cpu(*nid) == ep_nid)
+		*nid = cpu_to_le32(host_nid);
 }
 
 /**
@@ -490,9 +514,12 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 	struct qrtr_sock *ipc;
 	struct sk_buff *skb;
 	struct qrtr_cb *cb;
+	unsigned long flags;
 	size_t size;
 	unsigned int ver;
+	unsigned int nid;
 	size_t hdrlen;
+	int rc = 0;
 
 	if (len == 0 || len & 3)
 		return -EINVAL;
@@ -554,6 +581,8 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		goto err;
 
 	if ((cb->type == QRTR_TYPE_NEW_SERVER ||
+	     cb->type == QRTR_TYPE_DEL_SERVER ||
+	     cb->type == QRTR_TYPE_DEL_CLIENT ||
 	     cb->type == QRTR_TYPE_RESUME_TX) &&
 	    size < sizeof(struct qrtr_ctrl_pkt))
 		goto err;
@@ -562,25 +591,49 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 	    cb->type != QRTR_TYPE_RESUME_TX)
 		goto err;
 
+	/* Host assigned node ids are not supposed to overlap with
+	 * remote node ids
+	 */
+	if (cb->src_node >= QRTR_NODE_HOST_BASE)
+		goto err;
+
 	skb_put_data(skb, data + hdrlen, size);
 
-	if (node->ep_nid == QRTR_EP_NID_AUTO)
-		WRITE_ONCE(node->ep_nid, cb->src_node);
+	nid = cb->src_node;
 
-	if (node->nid == QRTR_EP_NID_AUTO || node->nid == cb->src_node)
-		qrtr_node_assign(node, cb->src_node);
+	spin_lock_irqsave(&qrtr_nodes_lock, flags);
+
+	if (node->ep_nid == QRTR_EP_NID_AUTO)
+		WRITE_ONCE(node->ep_nid, nid);
+
+	/* Add the source id to the lookup table only if 'node->nid' is auto
+	 * assigned or the packet came from a bridged node.
+	 */
+	if (node->nid == QRTR_EP_NID_AUTO || nid != node->ep_nid)
+		rc = __qrtr_node_assign(node, nid);
+
+	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
+
+	if (rc)
+		goto err_nid;
 
 	if (cb->type == QRTR_TYPE_NEW_SERVER) {
 		/* Remote node endpoint can bridge other distant nodes */
 		const struct qrtr_ctrl_pkt *pkt = data + hdrlen;
-		unsigned int server_node = le32_to_cpu(pkt->server.node);
 
-		if (server_node != node->ep_nid)
-			qrtr_node_assign(node, server_node);
+		nid = le32_to_cpu(pkt->server.node);
+		if (nid >= QRTR_NODE_HOST_BASE)
+			goto err;
+
+		if (nid != READ_ONCE(node->ep_nid)) {
+			rc = qrtr_node_assign(node, nid);
+			if (rc)
+				goto err_nid;
+		}
 	}
 
-	if (cb->src_node == node->ep_nid)
-		cb->src_node = node->nid;
+	if (cb->src_node == READ_ONCE(node->ep_nid))
+		cb->src_node = READ_ONCE(node->nid);
 
 	if (cb->type == QRTR_TYPE_NEW_SERVER ||
 	    cb->type == QRTR_TYPE_DEL_SERVER ||
@@ -605,6 +658,8 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 
 	return 0;
 
+err_nid:
+	pr_err_ratelimited("qrtr: cannot route node id %u: %d\n", nid, rc);
 err:
 	kfree_skb(skb);
 	return -EINVAL;
@@ -681,6 +736,7 @@ static void qrtr_hello_work(struct work_struct *work)
 int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 {
 	struct qrtr_node *node;
+	int rc;
 
 	if (!ep || !ep->xmit)
 		return -EINVAL;
@@ -702,7 +758,12 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	xa_init(&node->qrtr_tx_flow);
 	mutex_init(&node->qrtr_tx_lock);
 
-	qrtr_node_assign(node, nid);
+	rc = qrtr_node_assign(node, nid);
+	if (rc) {
+		pr_err("qrtr: cannot assign node id %u: %d\n", nid, rc);
+		kfree(node);
+		return rc;
+	}
 
 	mutex_lock(&qrtr_node_lock);
 	list_add(&node->item, &qrtr_all_nodes);
